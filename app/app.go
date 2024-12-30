@@ -1,20 +1,19 @@
 package app
 
 import (
-	"github.com/go-audio/wav"
-	"github.com/go-audio/audio"
-	"github.com/orcaman/writerseeker"
-	"io"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"github.com/getlantern/systray"
+	"github.com/go-audio/audio"
+	"github.com/go-audio/wav"
+	"github.com/gordonklaus/portaudio"
+	"github.com/orcaman/writerseeker"
+	hook "github.com/robotn/gohook"
+	"io"
+	"log"
 	"net/http"
 	"os"
-	"bytes"
-	"log"
-	"github.com/getlantern/systray"
-	hook "github.com/robotn/gohook"
-	"github.com/gordonklaus/portaudio"
-	"fmt"
 )
 
 func Run() {
@@ -40,7 +39,7 @@ func recordStream(stop <-chan struct{}) <-chan []float32 {
 			log.Fatalf("Error getting default host API: %v\n", err)
 		}
 
-		params := portaudio.LowLatencyParameters(host.DefaultInputDevice, host.DefaultOutputDevice)
+		params := portaudio.LowLatencyParameters(host.DefaultInputDevice, nil)
 		params.Input.Channels = 1
 
 		stream, err := portaudio.OpenStream(
@@ -121,6 +120,50 @@ func record(startRecording <-chan struct{}, stopRecording <-chan struct{}, stopL
 	return out
 }
 
+func playSamples(samples []float32, sampleRate float64) error {
+	host, err := portaudio.DefaultHostApi()
+	if err != nil {
+		return err
+	}
+
+	params := portaudio.LowLatencyParameters(nil, host.DefaultOutputDevice)
+
+	params.Output.Channels = 1
+	params.SampleRate = sampleRate
+
+	i := 0
+
+	done := make(chan struct{})
+
+	stream, err := portaudio.OpenStream(
+		params,
+		func(_ []float32, out []float32) {
+			for sample := range out {
+				if i >= len(samples) {
+					done <- struct{}{}
+					return
+				}
+				out[sample] = samples[i]
+				i++
+			}
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		stream.Stop()
+		stream.Close()
+	}()
+
+	stream.Start()
+
+	<-done
+
+	return nil
+}
+
 func samplesToBase64Wav(samples []float32) (string, error) {
 	ws := writerseeker.WriterSeeker{}
 	encoder := wav.NewEncoder(&ws, int(getSampleRate()), 32, 1, 1)
@@ -169,6 +212,45 @@ func samplesToBase64Wav(samples []float32) (string, error) {
 	return base64Wav, nil
 }
 
+func base64WavToSamples(base64Wav string) ([]float32, uint32, error) {
+	// Decode the base64 WAV data
+	wavData, err := base64.StdEncoding.DecodeString(base64Wav)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Create a reader for the WAV data
+	r := bytes.NewReader(wavData)
+
+	// Create a decoder for the WAV data
+	decoder := wav.NewDecoder(r)
+
+	// Read the WAV data
+	audioBuf, err := decoder.FullPCMBuffer()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Convert the audio data to float32 samples
+	samples := make([]float32, len(audioBuf.Data))
+	maxV := float32(0)
+	for i, v := range audioBuf.Data {
+		vFloat := float32(v)
+		samples[i] = vFloat
+		if vFloat > maxV {
+			maxV = vFloat
+		}
+	}
+
+	for i, v := range samples {
+		samples[i] = v / maxV
+	}
+
+	sampleRate := decoder.SampleRate
+
+	return samples, sampleRate, nil
+}
+
 type Audio struct {
 	Voice  string `json:"voice"`
 	Format string `json:"format"`
@@ -197,9 +279,14 @@ type Payload struct {
 	Messages   []Message `json:"messages"`
 }
 
+type ResponseAudio struct {
+	Data string `json:"data"`
+}
+
 type Choice struct {
 	Message struct {
-		Content string `json:"content"`
+		Content string        `json:"content"`
+		Audio   ResponseAudio `json:"audio"`
 	} `json:"message"`
 }
 
@@ -225,12 +312,15 @@ func onReady() {
 		defer hook.End()
 
 		ctrlDown := false
+		altDown := false
+		metaDown := false
 
 		startRecording := make(chan struct{})
 		stopRecording := make(chan struct{})
 		stopListening := make(chan struct{})
 
-		recording := record(startRecording, stopRecording, stopListening)
+		recordedSamples := record(startRecording, stopRecording, stopListening)
+		recording := false
 
 		defer func() {
 			stopListening <- struct{}{}
@@ -246,83 +336,111 @@ func onReady() {
 					}
 					if event.Kind == hook.KeyUp {
 						ctrlDown = false
-						stopRecording <- struct{}{}
 					}
 				}
-				// escape
-				if event.Rawcode == 53 {
-					if ctrlDown {
-						if event.Kind == hook.KeyDown || event.Kind == hook.KeyHold {
-							startRecording <- struct{}{}
-						}
+				// alt
+				if event.Rawcode == 58 {
+					if event.Kind == hook.KeyDown || event.Kind == hook.KeyHold {
+						altDown = true
+					}
+					if event.Kind == hook.KeyUp {
+						altDown = false
 					}
 				}
-			case samples := <-recording:
-				base64Wav, err := samplesToBase64Wav(samples)
-				if err != nil {
-					log.Fatalf("Error converting samples to WAV: %v\n", err)
+				// meta
+				if event.Rawcode == 55 {
+					if event.Kind == hook.KeyDown || event.Kind == hook.KeyHold {
+						metaDown = true
+					}
+					if event.Kind == hook.KeyUp {
+						metaDown = false
+					}
 				}
-				payload := Payload{
-					Model:      "gpt-4o-audio-preview",
-					Modalities: []string{"text"},
-					Audio: Audio{
-						Voice:  "alloy",
-						Format: "wav",
-					},
-					Messages: []Message{
-						{
-							Role: "user",
-							Content: []Content{
-								{
-									Type: "input_audio",
-									InputAudio: &InputAudio{
-										Data:   base64Wav,
-										Format: "wav",
+
+				if !recording && ctrlDown && altDown && metaDown {
+					recording = true
+					startRecording <- struct{}{}
+				}
+				if recording && !ctrlDown && !altDown && !metaDown {
+					stopRecording <- struct{}{}
+					recording = false
+				}
+			case samples := <-recordedSamples:
+				go func() {
+					base64Wav, err := samplesToBase64Wav(samples)
+					if err != nil {
+						log.Fatalf("Error converting samples to WAV: %v\n", err)
+					}
+					payload := Payload{
+						Model:      "gpt-4o-mini-audio-preview",
+						Modalities: []string{"text", "audio"},
+						Audio: Audio{
+							Voice:  "alloy",
+							Format: "wav",
+						},
+						Messages: []Message{
+							{
+								Role: "user",
+								Content: []Content{
+									{
+										Type: "input_audio",
+										InputAudio: &InputAudio{
+											Data:   base64Wav,
+											Format: "wav",
+										},
 									},
 								},
 							},
 						},
-					},
-				}
+					}
 
-				jsonPayload, err := json.Marshal(payload)
-				if err != nil {
-					log.Fatalf("Error marshalling payload: %v\n", err)
-					continue
-				}
+					jsonPayload, err := json.Marshal(payload)
+					if err != nil {
+						log.Fatalf("Error marshalling payload: %v\n", err)
+						return
+					}
 
-				apiUrl := "https://api.openai.com/v1/chat/completions"
-				headers := map[string]string{
-					"Content-Type": "application/json",
-					"Authorization": "Bearer " + os.Getenv("OPENAI_API_KEY"),
-				}
-				req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonPayload))
-				if err != nil {
-					log.Fatalf("Error creating request: %v\n", err)
-					continue
-				}
-				for k, v := range headers {
-					req.Header.Set(k, v)
-				}
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					log.Fatalf("Error making request: %v\n", err)
-					continue
-				}
-				defer resp.Body.Close()
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					log.Fatalf("Error reading response body: %v\n", err)
-					continue
-				}
-				var response Response
-				err = json.Unmarshal(body, &response)
-				if err != nil {
-					log.Fatalf("Error unmarshalling response: %v\n", err)
-					continue
-				}
-				text := response.Choices[0].Message.Content
-				fmt.Printf("%s\n", text)
+					apiUrl := "https://api.openai.com/v1/chat/completions"
+					headers := map[string]string{
+						"Content-Type":  "application/json",
+						"Authorization": "Bearer " + os.Getenv("OPENAI_API_KEY"),
+					}
+					req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonPayload))
+					if err != nil {
+						log.Fatalf("Error creating request: %v\n", err)
+						return
+					}
+					for k, v := range headers {
+						req.Header.Set(k, v)
+					}
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						log.Fatalf("Error making request: %v\n", err)
+						return
+					}
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Fatalf("Error reading response body: %v\n", err)
+						return
+					}
+					var response Response
+					err = json.Unmarshal(body, &response)
+					if err != nil {
+						log.Fatalf("Error unmarshalling response: %v\n", err)
+						return
+					}
+					data := response.Choices[0].Message.Audio.Data
+					samples, sampleRate, err := base64WavToSamples(data)
+					if err != nil {
+						log.Fatalf("Error converting base64 WAV to samples: %v\n", err)
+						return
+					}
+					err = playSamples(samples, float64(sampleRate))
+					if err != nil {
+						log.Fatalf("Error playing samples: %v\n", err)
+					}
+				}()
 			}
 		}
 	}()
