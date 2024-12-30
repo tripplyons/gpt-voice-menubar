@@ -1,14 +1,21 @@
 package app
 
-import "log"
-import "github.com/getlantern/systray"
-import hook "github.com/robotn/gohook"
-import "github.com/gordonklaus/portaudio"
-import "github.com/go-audio/wav"
-import "github.com/go-audio/audio"
-import "github.com/orcaman/writerseeker"
-import "io"
-import "encoding/base64"
+import (
+	"github.com/go-audio/wav"
+	"github.com/go-audio/audio"
+	"github.com/orcaman/writerseeker"
+	"io"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"os"
+	"bytes"
+	"log"
+	"github.com/getlantern/systray"
+	hook "github.com/robotn/gohook"
+	"github.com/gordonklaus/portaudio"
+	"fmt"
+)
 
 func Run() {
 	systray.Run(onReady, onExit)
@@ -92,19 +99,16 @@ func record(startRecording <-chan struct{}, stopRecording <-chan struct{}, stopL
 			select {
 			case <-startRecording:
 				if !recording {
-					log.Printf("Starting recording\n")
 					recording = true
 					joinedSamples = make([]float32, 0)
 				}
 			case <-stopRecording:
 				if recording {
-					log.Printf("Stopping recording\n")
 					recording = false
 					out <- joinedSamples
 					joinedSamples = nil
 				}
 			case <-stopListening:
-				log.Printf("Stopping listening\n")
 				return
 			case samples := <-recorded:
 				if joinedSamples != nil {
@@ -165,6 +169,46 @@ func samplesToBase64Wav(samples []float32) (string, error) {
 	return base64Wav, nil
 }
 
+type Audio struct {
+	Voice  string `json:"voice"`
+	Format string `json:"format"`
+}
+
+type InputAudio struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
+}
+
+type Content struct {
+	Type       string      `json:"type"`
+	Text       string      `json:"text,omitempty"`        // Omit if empty
+	InputAudio *InputAudio `json:"input_audio,omitempty"` // Omit if empty
+}
+
+type Message struct {
+	Role    string    `json:"role"`
+	Content []Content `json:"content"`
+}
+
+type Payload struct {
+	Model      string    `json:"model"`
+	Modalities []string  `json:"modalities"`
+	Audio      Audio     `json:"audio"`
+	Messages   []Message `json:"messages"`
+}
+
+type Choice struct {
+	Message struct {
+		Content string `json:"content"`
+	} `json:"message"`
+}
+
+type Choices []Choice
+
+type Response struct {
+	Choices Choices `json:"choices"`
+}
+
 func onReady() {
 	systray.SetTitle("GPT")
 	systray.SetTooltip("GPT")
@@ -214,12 +258,71 @@ func onReady() {
 					}
 				}
 			case samples := <-recording:
-				log.Printf("Got %d joined samples\n", len(samples))
 				base64Wav, err := samplesToBase64Wav(samples)
 				if err != nil {
-					log.Printf("Error converting samples to WAV: %v\n", err)
+					log.Fatalf("Error converting samples to WAV: %v\n", err)
 				}
-				log.Printf("Got %d joined samples, converted to WAV with base64 length %d\n", len(samples), len(base64Wav))
+				payload := Payload{
+					Model:      "gpt-4o-audio-preview",
+					Modalities: []string{"text"},
+					Audio: Audio{
+						Voice:  "alloy",
+						Format: "wav",
+					},
+					Messages: []Message{
+						{
+							Role: "user",
+							Content: []Content{
+								{
+									Type: "input_audio",
+									InputAudio: &InputAudio{
+										Data:   base64Wav,
+										Format: "wav",
+									},
+								},
+							},
+						},
+					},
+				}
+
+				jsonPayload, err := json.Marshal(payload)
+				if err != nil {
+					log.Fatalf("Error marshalling payload: %v\n", err)
+					continue
+				}
+
+				apiUrl := "https://api.openai.com/v1/chat/completions"
+				headers := map[string]string{
+					"Content-Type": "application/json",
+					"Authorization": "Bearer " + os.Getenv("OPENAI_API_KEY"),
+				}
+				req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonPayload))
+				if err != nil {
+					log.Fatalf("Error creating request: %v\n", err)
+					continue
+				}
+				for k, v := range headers {
+					req.Header.Set(k, v)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					log.Fatalf("Error making request: %v\n", err)
+					continue
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					log.Fatalf("Error reading response body: %v\n", err)
+					continue
+				}
+				var response Response
+				err = json.Unmarshal(body, &response)
+				if err != nil {
+					log.Fatalf("Error unmarshalling response: %v\n", err)
+					continue
+				}
+				text := response.Choices[0].Message.Content
+				fmt.Printf("%s\n", text)
 			}
 		}
 	}()
