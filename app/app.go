@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"os"
+
 	"github.com/getlantern/systray"
 	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
 	"github.com/gordonklaus/portaudio"
 	"github.com/orcaman/writerseeker"
 	hook "github.com/robotn/gohook"
-	"io"
-	"log"
-	"net/http"
-	"os"
 )
 
 func Run() {
@@ -292,8 +293,13 @@ type Choice struct {
 
 type Choices []Choice
 
+type Error struct {
+	Message string `json:"message"`
+}
+
 type Response struct {
 	Choices Choices `json:"choices"`
+	Error   *Error  `json:"error",omitempty`
 }
 
 func onReady() {
@@ -431,6 +437,10 @@ func onReady() {
 					err = json.Unmarshal(body, &response)
 					if err != nil {
 						log.Fatalf("Error unmarshalling response: %v\n", err)
+						return
+					}
+					if response.Error != nil {
+						log.Fatalf("Error: %s\n", response.Error.Message)
 						return
 					}
 					data := response.Choices[0].Message.Audio.Data
