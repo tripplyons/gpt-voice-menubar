@@ -360,13 +360,16 @@ func onReady() {
 				if !recording && ctrlDown && altDown && metaDown {
 					recording = true
 					startRecording <- struct{}{}
+					log.Println("Recording")
 				}
 				if recording && !ctrlDown && !altDown && !metaDown {
 					stopRecording <- struct{}{}
 					recording = false
+					log.Println("Stopped recording")
 				}
 			case samples := <-recordedSamples:
 				go func() {
+					log.Printf("Recorded %d samples\n", len(samples))
 					base64Wav, err := samplesToBase64Wav(samples)
 					if err != nil {
 						log.Fatalf("Error converting samples to WAV: %v\n", err)
@@ -436,6 +439,7 @@ func onReady() {
 						log.Fatalf("Error converting base64 WAV to samples: %v\n", err)
 						return
 					}
+					log.Printf("Playing %d samples at %d Hz\n", len(samples), sampleRate)
 					err = playSamples(samples, float64(sampleRate))
 					if err != nil {
 						log.Fatalf("Error playing samples: %v\n", err)
