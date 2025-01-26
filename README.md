@@ -2,6 +2,8 @@
 
 Talk with GPT-4o from a simple keyboard shortcut
 
+![Screenshot](screenshot.png)
+
 ## Installation
 
 ```bash
